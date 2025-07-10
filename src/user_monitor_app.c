@@ -220,7 +220,7 @@ static void* status_monitor_thread(void* arg)
             else if (bytes_read > 0)
             {
                 printf("WARNING: Received partial status data (%zd bytes)\n", bytes_read);
-            } 
+            }
         }
         else if (result < 0 && errno != EINTR)
         {
