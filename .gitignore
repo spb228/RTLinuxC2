@@ -1,2 +1,7 @@
-/build/build/*
+build/build/*
 bin/userMonitorApp
+src/*.ko*
+src/*.o*
+src/*.mod*
+src/*.order*
+src/*.symvers*

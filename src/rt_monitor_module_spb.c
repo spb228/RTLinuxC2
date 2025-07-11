@@ -72,7 +72,7 @@ static ktime_t task_period;                 /* period between monitoring cycles 
 static int major_cmd = 240, major_status = 241;     /* fixed major device numbers */
 static struct cdev cmd_cdev, status_cdev; 
 static struct class *rtf_class; 
-static struct device *cmt_device, *status_device; 
+static struct device *cmd_device, *status_device; 
 
 /* simulated sensor data */
 static int current_sensor_value = 50; 
@@ -194,20 +194,219 @@ static void process_command(rt_command_t *cmd)
     }
 }
 
-
-
-
-
-static int __init simple_module_init(void)
+/* real-time monitor task function */
+static int rt_monitor_task(void *arg)
 {
-    printk(KERN_INFO "Hello from simple module!\n");
+    /* set this thread to real-time priority (SCHED FIFO with highest priority) */
+    struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 }; 
+    //sched_setscheduler(current, SCHED_FIFO, &param); /* getting error "sched_setscheduler not defined"
+    sched_set_fifo(current);
+
+    pr_info("RT Monitor task started, period %lld ns\n", ktime_to_ns(task_period));
+
+    while (!kthread_should_stop() && task_running)
+    {
+        /* put thread to sleep until woken by timer */
+        set_current_state(TASK_UNINTERRUPTIBLE);
+        schedule();
+
+        if (monitoring_active)
+        {
+            current_sensor_value = simulate_sensor_reading();
+            update_status();
+
+            /* check for alarm condition */
+            if (current_sensor_value > system_status.threshold)
+            {
+                system_status.status = STATUS_ALARM; 
+                system_status.alarm_count++; 
+            }
+            else if (system_status.status == STATUS_ALARM)
+            {
+                system_status.status = STATUS_MONITORING; 
+            }
+
+            send_status_update(); /* notify user space app of status update */
+        }
+    }
+
+    pr_info("RT monitor task terminated\n");
+        return 0; 
+}
+
+/* Command device file ops - handle user space access to devices (/dev/rtf0) */
+static int cmd_open(struct inode *inode, struct file *file) {  return 0;  } /* open cmd device for writing */
+
+static int cmd_release(struct inode *inode, struct file *file) { return 0; } /* relinquish cmd device */
+
+static ssize_t cmd_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+    rt_command_t cmd; 
+
+    /* validate write size */
+    if (count != sizeof(rt_command_t)) return -EINVAL; 
+
+    /* copy command from user space to kernel space. if fail, return error */
+    if (copy_from_user(&cmd, buf, sizeof(rt_command_t))) return -EFAULT;
+    
+    cmd.timestamp = ktime_get();
+
+    /* process command */
+    mutex_lock(&cmd_mutex);
+    process_command(&cmd); 
+    mutex_unlock(&cmd_mutex); 
+
+    return count; /* return num of bytes written */
+}
+
+/* file ops structure for command device */
+static struct file_operations cmd_fops = 
+{
+    .open = cmd_open,
+    .release = cmd_release,
+    .write = cmd_write,
+};
+
+/* Command device file ops - handle user space access to devices (/dev/rtf0) */
+static int status_open(struct inode *inode, struct file *file) { return 0; }
+
+static int status_release(struct inode *inode, struct file *file) { return 0; }
+
+static ssize_t status_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+    if (count < sizeof(rt_status_t)) return -EINVAL; 
+
+    if (file->f_flags & O_NONBLOCK)
+    {
+        /* if non-blocking, return immediately if no data available */
+        if (!status_ready) return -EAGAIN; 
+    }
+    else
+    {
+        /* if blocking, wait for status data to be available */
+        if (wait_event_interruptible(status_wait, status_ready)) return -ERESTARTSYS; 
+    }
+
+    mutex_lock(&status_mutex);
+    if (copy_to_user(buf, &system_status, sizeof(rt_status_t)))
+    {
+        /* TODO: investigate if need to put status ready to 0 here as well ? */
+        mutex_unlock(&status_mutex);
+        return -EFAULT; 
+    }
+    status_ready = 0; 
+    mutex_unlock(&status_mutex);
+
+    return sizeof(rt_status_t); 
+}
+
+/* poll for status device */
+static unsigned int status_poll(struct file *file, poll_table *wait)
+{
+    /* register this file with wait queue */
+    poll_wait(file, &status_wait, wait);
+
+    /* return appropriate poll flags */
+    return status_ready ? (POLLIN | POLLRDNORM) : 0; 
+}
+
+/* file ops structure for status device */
+static struct file_operations status_fops = 
+{
+    .open = status_open,
+    .release = status_release, 
+    .read = status_read, 
+    .poll = status_poll,
+};
+
+
+static int __init rt_monitor_init(void)
+{
+    int ret; 
+    pr_info("RTLinux Real-Time Monitor Initializing\n");
+
+    /* initialize system status with def values */
+    memset(&system_status, 0, sizeof(rt_status_t)); 
+    system_status.status = STATUS_IDLE; 
+    system_status.frequency_hz = 10; 
+    system_status.threshold = 75; 
+    task_period = ktime_set(0, NSEC_PER_SEC / 10); /* 100ms period (10 Hz) */
+
+    /* register character devices */
+    ret = register_chrdev(major_cmd, "rtf0", &cmd_fops); 
+    if (ret < 0)
+    {
+        pr_err("Failed to register command device: %d\n", ret); 
+    }
+    ret = register_chrdev(major_status, "rtf1", &status_fops); 
+    if (ret < 0)
+    {
+        pr_err("Failed to register status device: %d\n", ret);
+        unregister_chrdev(major_cmd, "rtf0");
+        return ret;
+    }
+
+    /* create device class for udev */
+    rtf_class = class_create("rtf"); 
+    if (IS_ERR(rtf_class))
+    {
+        pr_err("Failed to create device class\n");
+        unregister_chrdev(major_cmd, "rtf0");
+        unregister_chrdev(major_status, "rtf1");
+        return PTR_ERR(rtf_class);
+    }
+
+    /* create device nodes */
+    cmd_device = device_create(rtf_class, NULL, MKDEV(major_cmd, 0), NULL, "rtf0");
+    status_device = device_create(rtf_class, NULL, MKDEV(major_status, 0), NULL, "rtf1");
+
+    /* initialize high-res timer which will periodically wake up RT task */
+    hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    timer.function = timer_func; 
+
+    /* create and start RT monitorting task */
+    task_running = 1; 
+    rt_monitor_thread = kthread_create(rt_monitor_task, NULL, "rt_monitor");
+    if (IS_ERR(rt_monitor_thread))
+    {
+        pr_err("Failed to create RT Task: %d\n", PTR_ERR(rt_monitor_thread));
+        task_running = 0; 
+        device_destroy(rtf_class, MKDEV(major_status, 0)); 
+        device_destroy(rtf_class, MKDEV(major_cmd, 0));
+        class_destroy(rtf_class);
+        unregister_chrdev(major_cmd, "rtf0");
+        unregister_chrdev(major_status, "rtf1");
+        return PTR_ERR(rt_monitor_thread);
+    }
+
+    wake_up_process(rt_monitor_thread); 
+    pr_info("RTLinux Real-Time Monitor initialized successfully\n");
+    pr_info("Command fifo: /dev/rtf0\n");
+    pr_info("Status fifo: /dev/rtf1\n");
+
     return 0; 
 }
 
-static void __exit simple_module_exit(void)
+static void __exit rt_monitor_exit(void)
 {
-    printk(KERN_INFO "Goodbye from simple module\n");
+    pr_info("RTLinux Real-time Monitor shutting down\n");
+    task_running = 0; 
+    monitoring_active = 0; 
+    hrtimer_cancel(&timer); 
+
+    if (rt_monitor_thread) 
+    {
+        kthread_stop(rt_monitor_thread);
+    }
+
+    device_destroy(rtf_class, MKDEV(major_status, 0)); 
+    device_destroy(rtf_class, MKDEV(major_cmd, 0));
+    class_destroy(rtf_class);
+    unregister_chrdev(major_cmd, "rtf0");
+    unregister_chrdev(major_status, "rtf1");
+
+    pr_info("RTLinux Real-time Monitor shutdown complete\n");
 }
 
-module_init(simple_module_init);
-module_exit(simple_module_exit);
+module_init(rt_monitor_init);
+module_exit(rt_monitor_exit);
